@@ -1,0 +1,253 @@
+#include <Wire.h>
+#include <MPU6050.h>
+
+// Encoder Pin Definitions
+#define ENC_FL_A 2   // Front Left (Interrupt Pin)
+#define ENC_FL_B 31  // Front Left (Non-Interrupt)
+#define ENC_FR_A 3   // Front Right (Interrupt Pin)
+#define ENC_FR_B 23  // Front Right (Non-Interrupt)
+#define ENC_BL_A 18  // Back Left (Interrupt Pin)
+#define ENC_BL_B 35  // Back Left (Non-Interrupt)
+#define ENC_BR_A 19  // Back Right (Interrupt Pin)
+#define ENC_BR_B 27  // Back Right (Non-Interrupt)
+
+// Motor Driver Pin Definitions
+#define M1INA 22  
+#define M1INB 24  
+#define M1EN 26   
+#define M1PWM 4   
+
+#define M2INA 28  
+#define M2INB 30  
+#define M2EN 32   
+#define M2PWM 5   
+
+// Ultrasonic Sensor Pin Definitions
+#define M2 39  
+#define M5 41  
+
+// Constants for Distance Calculations
+const float WHEEL_DIAMETER_IN = 4.0;
+const float WHEEL_CIRCUMFERENCE_IN = 3.1416 * WHEEL_DIAMETER_IN;
+const int ENCODER_CPR = 64;
+const int GEAR_RATIO = 70;
+const int EFFECTIVE_CPR = ENCODER_CPR * GEAR_RATIO; // 4480 CPR per wheel revolution
+const float DISTANCE_PER_PULSE = (WHEEL_CIRCUMFERENCE_IN / EFFECTIVE_CPR) * 5.05; // 0.0028 inches per pulse
+
+volatile long encoderFL = 0, encoderFR = 0, encoderBL = 0, encoderBR = 0;
+
+// MPU6050 Setup
+MPU6050 mpu;
+float accelX, accelY, accelZ;
+float gyroX, gyroY, gyroZ;
+float velocityX = 0;
+float positionX = 0, positionY = 0;
+float alpha = 0.98;  
+unsigned long lastTime;
+
+// Calibration offsets
+float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
+float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
+
+// Obstacle Detection
+const float OBSTACLE_THRESHOLD = 12.0; // Stop if object is within 12 inches
+bool robotStopped = false; // Flag to indicate if the robot has stopped
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    mpu.initialize();
+    if (!mpu.testConnection()) {
+        Serial.println("MPU6050 connection failed!");
+        while (1);
+    }
+
+    // Calibrate MPU6050
+    calibrateMPU6050();
+
+    pinMode(M1INA, OUTPUT);
+    pinMode(M1INB, OUTPUT);
+    pinMode(M1EN, OUTPUT);
+    pinMode(M1PWM, OUTPUT);
+    
+    pinMode(M2INA, OUTPUT);
+    pinMode(M2INB, OUTPUT);
+    pinMode(M2EN, OUTPUT);
+    pinMode(M2PWM, OUTPUT);
+
+    // Set Encoder A pins as inputs with pull-ups
+    pinMode(ENC_FL_A, INPUT_PULLUP);
+    pinMode(ENC_FR_A, INPUT_PULLUP);
+    pinMode(ENC_BL_A, INPUT_PULLUP);
+    pinMode(ENC_BR_A, INPUT_PULLUP);
+
+    // Attach Interrupts for Encoder A signals
+    attachInterrupt(digitalPinToInterrupt(ENC_FL_A), encoderFL_ISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_FR_A), encoderFR_ISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_BL_A), encoderBL_ISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_BR_A), encoderBR_ISR, FALLING);
+
+    Serial.println("Starting distance test...");
+    delay(2000);
+
+    // Reset encoder counts
+    encoderFL = 0;
+    encoderFR = 0;
+    encoderBL = 0;
+    encoderBR = 0;
+
+    lastTime = millis();
+
+    moveForward();
+}
+
+void loop() {
+    unsigned long currentTime = millis();
+    float dt = (currentTime - lastTime) / 1000.0;  // Time difference in seconds
+    lastTime = currentTime;
+
+    // Read ultrasonic sensor distances
+    float distanceFrontRight = readMB1010_PWM(M2);
+    float distanceFrontLeft = readMB1010_PWM(M5);
+
+    // Check for obstacles
+    if (!robotStopped && (distanceFrontRight < OBSTACLE_THRESHOLD || distanceFrontLeft < OBSTACLE_THRESHOLD)) {
+        stopMotors();
+        robotStopped = true; // Set the flag to indicate the robot has stopped
+        Serial.println("Obstacle detected! Stopping.");
+        delay(500); // Wait for the robot to come to a complete stop
+    }
+
+    // If the robot has stopped, freeze the IMU position
+    if (robotStopped) {
+        Serial.print("Final IMU Position X: "); Serial.print(positionX, 2); // Lateral drift in inches
+        Serial.print(" in Y: "); Serial.print(positionY, 2); // Forward movement in inches
+        Serial.print(" in | Grid Position: ("); Serial.print(getGridX(positionX));
+        Serial.print(", "); Serial.print(getGridY(positionY)); Serial.println(")");
+        Serial.println("Robot has stopped.");
+        delay(1000); // Wait for 1 second before exiting
+        return; // Exit the loop to freeze the position
+    }
+
+    // Read raw sensor data
+    int axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw;
+    mpu.getMotion6(&axRaw, &ayRaw, &azRaw, &gxRaw, &gyRaw, &gzRaw);
+
+    // Convert raw data to physical values
+    float rawAccelX = (axRaw / 16384.0) * 9.81 - accelOffsetX;
+    float rawAccelY = (ayRaw / 16384.0) * 9.81 - accelOffsetY;
+    float rawAccelZ = (azRaw / 16384.0) * 9.81 - accelOffsetZ;
+
+    float rawGyroX = (gxRaw / 131.0) - gyroOffsetX;
+    float rawGyroY = (gyRaw / 131.0) - gyroOffsetY;
+    float rawGyroZ = (gzRaw / 131.0) - gyroOffsetZ;
+
+    // Apply Complementary Filter for orientation estimation
+    float angleX = alpha * (angleX + rawGyroX * dt) + (1 - alpha) * atan2(rawAccelY, rawAccelZ) * 180 / PI;
+    float angleY = alpha * (angleY + rawGyroY * dt) + (1 - alpha) * atan2(rawAccelX, rawAccelZ) * 180 / PI;
+
+    // Remove gravity from accelerometer data
+    float accelWorldX = rawAccelX - sin(angleY * PI / 180) * 9.81;
+    float accelWorldY = rawAccelY + sin(angleX * PI / 180) * 9.81;
+
+    // Integrate acceleration to get velocity
+    velocityX += accelWorldX * dt * 0.1; // Scale down lateral movement
+
+    // Integrate velocity to get position
+    positionX += velocityX * dt;
+
+    // Calculate encoder-corrected distance
+    float distanceFL = encoderFL * DISTANCE_PER_PULSE;
+    float distanceFR = encoderFR * DISTANCE_PER_PULSE;
+    float distanceBL = encoderBL * DISTANCE_PER_PULSE;
+    float distanceBR = encoderBR * DISTANCE_PER_PULSE;
+
+    // Average encoder distances for ground truth
+    float encoderDistance = (distanceFL + distanceFR + distanceBL + distanceBR) / 4.0;
+
+    // Correct IMU position using encoder data
+    positionY = encoderDistance; // Use encoder distance as ground truth for forward movement
+
+    // Print debug information (all values in inches)
+    Serial.print("IMU Position X: "); Serial.print(positionX, 2); // Lateral drift in inches
+    Serial.print(" in Y: "); Serial.print(positionY, 2); // Forward movement in inches
+    Serial.print(" in | Grid Position: ("); Serial.print(getGridX(positionX));
+    Serial.print(", "); Serial.print(getGridY(positionY)); Serial.print(")");
+    Serial.print(" | Encoder Distance: "); Serial.print(encoderDistance, 2); // Encoder-corrected distance
+    Serial.print(" in | Front Right: "); Serial.print(distanceFrontRight);
+    Serial.print(" in | Front Left: "); Serial.println(distanceFrontLeft);
+
+    delay(10);  
+}
+
+// Interrupt Service Routines (ISRs)
+void encoderFL_ISR() { encoderFL++; }
+void encoderFR_ISR() { encoderFR++; }
+void encoderBL_ISR() { encoderBL++; }
+void encoderBR_ISR() { encoderBR++; }
+
+void calibrateMPU6050() {
+    Serial.println("Calibrating MPU6050...");
+    int numSamples = 100;
+    for (int i = 0; i < numSamples; i++) {
+        int axRaw, ayRaw, azRaw, gxRaw, gyRaw, gzRaw;
+        mpu.getMotion6(&axRaw, &ayRaw, &azRaw, &gxRaw, &gyRaw, &gzRaw);
+
+        accelOffsetX += (axRaw / 16384.0) * 9.81;
+        accelOffsetY += (ayRaw / 16384.0) * 9.81;
+        accelOffsetZ += (azRaw / 16384.0) * 9.81 - 9.81; // Remove gravity
+
+        gyroOffsetX += (gxRaw / 131.0);
+        gyroOffsetY += (gyRaw / 131.0);
+        gyroOffsetZ += (gzRaw / 131.0);
+
+        delay(10);
+    }
+
+    accelOffsetX /= numSamples;
+    accelOffsetY /= numSamples;
+    accelOffsetZ /= numSamples;
+
+    gyroOffsetX /= numSamples;
+    gyroOffsetY /= numSamples;
+    gyroOffsetZ /= numSamples;
+
+    Serial.println("Calibration complete!");
+}
+
+void moveForward() {
+    digitalWrite(M1EN, HIGH);
+    digitalWrite(M2EN, HIGH);
+    
+    digitalWrite(M1INA, LOW);
+    digitalWrite(M1INB, HIGH);
+    analogWrite(M1PWM, 40); // Left motor slower speed
+
+    digitalWrite(M2INA, LOW);
+    digitalWrite(M2INB, HIGH);
+    analogWrite(M2PWM, 50); // Right motor slower speed
+}
+
+void stopMotors() {
+    digitalWrite(M1EN, LOW);
+    digitalWrite(M2EN, LOW);
+    analogWrite(M1PWM, 0);
+    analogWrite(M2PWM, 0);
+}
+
+float readMB1010_PWM(int sensorPin) {
+    unsigned long pulseWidth = pulseIn(sensorPin, HIGH);
+    float distance_cm = pulseWidth / 58.0;
+    return distance_cm * 0.3937; // Convert cm to inches
+}
+
+// Convert IMU X position to grid coordinate (0-8)
+int getGridX(float positionX) {
+    return constrain((int)(positionX / 12.0), 0, 8);
+}
+
+// Convert IMU Y position to grid coordinate (0-8)
+int getGridY(float positionY) {
+    return constrain((int)(positionY / 12.0), 0, 8);
+}
